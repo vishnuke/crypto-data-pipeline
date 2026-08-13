@@ -1,0 +1,9 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir kafka-python==2.0.2 requests==2.32.3 tenacity==8.5.0
+
+COPY scripts/producer.py /app/producer.py
+
+CMD ["python", "producer.py"]

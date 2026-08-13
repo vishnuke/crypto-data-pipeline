@@ -1,0 +1,176 @@
+version: "3.8"
+
+# ---------------------------------------------------------------------------
+# Resource-tuned for an 8GB RAM / 4-thread machine (Intel i3-6100T class).
+# Design choices made specifically for this constraint:
+#   - Kafka runs in KRaft mode -> no Zookeeper container (~500MB-1GB saved)
+#   - Airflow uses LocalExecutor -> no Redis / Celery worker / Flower
+#   - Every service has an explicit mem_limit so Docker can't let one
+#     container starve the others and freeze the host
+#   - JVM heap for Kafka is capped explicitly (default would try to grab
+#     25% of host RAM which is too much here)
+#
+# Rough budget (leave ~2GB free for Windows/host OS):
+#   postgres   256m
+#   kafka      768m
+#   airflow-webserver   1024m
+#   airflow-scheduler   1024m
+#   producer   128m
+#   ---------------------------
+#   total      ~3.2GB  (comfortable headroom on an 8GB machine)
+# ---------------------------------------------------------------------------
+
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    AIRFLOW__CORE__PARALLELISM: "4"
+    AIRFLOW__CORE__DAG_CONCURRENCY: "4"
+    AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "60"
+    # Kafka + Snowflake settings pulled from .env at runtime
+    KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+    KAFKA_TOPIC: "crypto_prices"
+    SNOWFLAKE_ACCOUNT: ${SNOWFLAKE_ACCOUNT}
+    SNOWFLAKE_USER: ${SNOWFLAKE_USER}
+    SNOWFLAKE_PASSWORD: ${SNOWFLAKE_PASSWORD}
+    SNOWFLAKE_WAREHOUSE: ${SNOWFLAKE_WAREHOUSE}
+    SNOWFLAKE_DATABASE: ${SNOWFLAKE_DATABASE}
+    SNOWFLAKE_SCHEMA_BRONZE: ${SNOWFLAKE_SCHEMA_BRONZE:-BRONZE}
+    SNOWFLAKE_SCHEMA_SILVER: ${SNOWFLAKE_SCHEMA_SILVER:-SILVER}
+    SNOWFLAKE_ROLE: ${SNOWFLAKE_ROLE}
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./config:/opt/airflow/config
+  depends_on:
+    postgres:
+      condition: service_healthy
+    kafka:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+    mem_limit: 256m
+    restart: always
+
+  kafka:
+    # Official Apache Software Foundation image - KRaft-native, no Zookeeper,
+    # no third-party licensing surprises (bitnami/kafka's free tags were
+    # pulled behind a paid "Secure Images" tier in 2025 - this replaces it).
+    image: apache/kafka:3.8.0
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_NUM_PARTITIONS: "1"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Fixed cluster ID so restarts against the persisted volume stay consistent
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+      # Cap the JVM heap - critical on 8GB hosts
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms512m"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    mem_limit: 768m
+    restart: always
+
+  kafka-init-topics:
+    image: apache/kafka:3.8.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: >
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic crypto_prices --partitions 1 --replication-factor 1
+    mem_limit: 128m
+
+  producer:
+    build:
+      context: .
+      dockerfile: Dockerfile.producer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      KAFKA_TOPIC: "crypto_prices"
+      CRYPTO_API_URL: "https://api.coingecko.com/api/v3/simple/price"
+      CRYPTO_SYMBOLS: "bitcoin,ethereum,solana,cardano"
+      POLL_INTERVAL_SECONDS: "30"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    mem_limit: 128m
+    restart: always
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username admin --password admin \
+          --firstname Admin --lastname User \
+          --role Admin --email admin@example.com || true
+    mem_limit: 1024m
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    mem_limit: 1024m
+    restart: always
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    mem_limit: 1024m
+    restart: always
+
+volumes:
+  postgres-db-volume:
+  kafka-data:
