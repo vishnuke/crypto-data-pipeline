@@ -58,7 +58,7 @@ FROM (
         symbol, price_usd, change_24h_pct, ingested_at,
         ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY ingested_at DESC) AS rn
     FROM CRYPTO_DB.SILVER.CRYPTO_PRICES
-)
+) AS ranked
 WHERE rn = 1;
 
 -- -----------------------------------------------------------------------------

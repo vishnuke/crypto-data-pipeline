@@ -101,8 +101,8 @@ def main():
 
             producer.flush()
 
-        except Exception as exc:  # noqa: BLE001 - producer loop must never die silently
-            log.error("Error during poll/publish cycle: %s", exc, exc_info=True)
+        except Exception:
+            log.exception("Error during poll/publish cycle")
 
         time.sleep(POLL_INTERVAL)
 
