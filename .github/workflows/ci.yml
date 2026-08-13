@@ -1,0 +1,98 @@
+name: CI
+
+# Runs on every push and PR touching the pipeline code. Deliberately
+# lightweight - no live Airflow/Kafka/Snowflake needed, so it runs in
+# under a couple of minutes and catches the mistakes that are cheap to
+# catch early: syntax errors, bad YAML, and SQL style issues.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-python:
+    name: Lint DAGs & scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install lint tools
+        run: pip install ruff
+
+      - name: Check DAGs and scripts compile
+        run: |
+          python -m py_compile dags/*.py scripts/*.py
+
+      - name: Ruff lint (style + common bugs)
+        run: |
+          ruff check dags/ scripts/ --output-format=github
+
+  lint-sql:
+    name: Lint Snowflake SQL
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install sqlfluff
+        run: pip install sqlfluff
+
+      - name: Lint SQL against Snowflake dialect
+        run: sqlfluff lint sql/ --dialect snowflake
+
+  validate-compose:
+    name: Validate docker-compose.yml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: docker compose config (syntax + interpolation check)
+        run: docker compose config --quiet
+        env:
+          SNOWFLAKE_ACCOUNT: dummy
+          SNOWFLAKE_USER: dummy
+          SNOWFLAKE_PASSWORD: dummy
+          SNOWFLAKE_WAREHOUSE: dummy
+          SNOWFLAKE_DATABASE: dummy
+          SNOWFLAKE_ROLE: dummy
+
+  check-dag-import:
+    name: Verify DAG imports without errors
+    runs-on: ubuntu-latest
+    # This is the closest thing to "does Airflow actually accept this DAG"
+    # without standing up a full Airflow instance - it installs just enough
+    # to import the DAG module and catch missing-import/syntax issues that
+    # py_compile alone wouldn't catch (e.g. a bad provider import path).
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Airflow + providers (constrained, matches Dockerfile)
+        run: |
+          pip install "apache-airflow==2.9.3" apache-airflow-providers-snowflake kafka-python tenacity boto3 \
+            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.9.3/constraints-3.11.txt"
+
+      - name: Import DAG module
+        run: |
+          export AIRFLOW_HOME=/tmp/airflow_home
+          python -c "
+          import sys
+          sys.path.insert(0, 'dags')
+          import kafka_consumer_dag
+          print('DAG imported OK:', kafka_consumer_dag.dag.dag_id)
+          "
