@@ -188,11 +188,5 @@ Worth documenting even if you don't build it:
 
 - **S3 Bronze landing** before Snowflake, so raw events are durable even
   if Snowflake is briefly unavailable.
-- **Data quality checks**: add a Great Expectations or dbt-test step after
-  `merge_silver` (e.g. `price_usd IS NOT NULL AND price_usd > 0`).
-- **CI/CD**: GitHub Actions workflow that lints the DAG (`airflow dags
-  list-import-errors`), runs `sqlfluff` on the SQL, and on merge to `main`
-  deploys DAGs to a remote Airflow instance (e.g. via `rsync`/`git-sync`
-  sidecar or MWAA/Composer's deploy mechanism).
 - **Spark Structured Streaming** in place of the Airflow micro-batch
   consumer, if you outgrow 5-minute batch latency.
